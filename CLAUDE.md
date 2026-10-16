@@ -1,6 +1,6 @@
 # CLAUDE.md — Bonap
 
-Mémoire projet pour Claude Code. Compressée depuis les 5 livrables `docs/` (MVP-SCOPE, PDL, SDLC, ROADMAP, MVP-EXEC). Mis à jour : 2026-08-28.
+Mémoire projet pour Claude Code. Compressée depuis les 5 livrables `docs/` (MVP-SCOPE, PDL, SDLC, ROADMAP, MVP-EXEC). Mis à jour : 2026-09-11.
 
 ## 1. Projet
 
@@ -338,15 +338,37 @@ npm run preview  # Prévisualisation prod
 - **Anthropic-only streaming + tool use** : les 8 autres providers ont fallback single-turn sans tools — documenté dans Settings.
 - **OpenCode Go/Zen** : pas de CORS header → proxy Vite/nginx (`/api/opencode-go`, `/api/opencode`), comme Ollama.
 
+### Sécurité (revue du 2026-09-11 — voir `SECURITY.md`)
+- **Bonap n'a pas d'auth** : tout visiteur agit sur Mealie avec les droits du token. Tout ce qui est dans `/env-config.js` (`window.__ENV__`) est public.
+- **Token Mealie côté serveur (Docker + addon HA)** : n'est plus écrit dans `env-config.js`. nginx l'injecte sur `/api/` via `map "$http_x_bonap_client:$http_authorization" $bonap_mealie_auth` — uniquement si le client envoie `X-Bonap-Client: 1` sans `Authorization` (en-tête custom = preflight CORS → anti-CSRF). `MealieApiClient.authHeaders()` envoie cet en-tête en runtime Docker. **Tout nouvel appel Mealie doit passer par `MealieApiClient`** (un `fetch` direct vers `/api/...` n'aura pas le token). Échappatoire : `BONAP_EXPOSE_MEALIE_TOKEN=true`.
+- **Sorties réseau du BFF** : toute URL venant du navigateur (ou d'une page distante) passe par `safeRequest()` (`ha-addon/bff-net-guard.cjs`) — jamais `fetch()` direct. Politique `public` (import recette, proxy image) ou `local` (Ollama choisi dans Settings). L'IP est validée dans le hook `lookup` du socket (anti DNS rebinding / TOCTOU) et à chaque redirection. Tester une string de hostname ne protège de rien. Nouveau fichier BFF → l'ajouter au `COPY` des deux Dockerfiles.
+- **Proxy image** (`/marmiton/image`) : seulement `image/jpeg|png|webp|gif|avif`, avec `CSP sandbox` + `nosniff`. Relayer du SVG/HTML depuis l'origine Bonap = XSS.
+- **`/ollama-proxy`** : `OLLAMA_URL` (env) prime sur `X-Ollama-Target` ; endpoints Ollama en liste blanche (`OLLAMA_ROUTES`), réponses JSON uniquement, erreurs génériques. `BONAP_DYNAMIC_OLLAMA_PROXY=false` coupe la cible dynamique (idem `ollamaUrl` de `/marmiton/fetch-recipe`).
+- **`/settings` (BFF)** : clés en liste blanche (`ha-addon/bff-settings.cjs`, miroir de `SERVER_SETTINGS_KEYS` — **ajouter une clé des deux côtés**), chaînes ≤ 16 Ko, `apiKey` retirée de `bonap_llm_config` (le serveur purge aussi les anciens fichiers). Côté front, `toServerSettingValue` / `mergeServerSettingValue` gardent la clé API dans le localStorage.
+- **Gemini** : clé en en-tête `x-goog-api-key`, jamais `?key=` dans l'URL.
+- **Tests BFF** : `npm run test:bff` (`node --test`, inclus dans `npm test`).
+
 ### Shopping
 - L'ajout d'un item existant (même `foodKey`) **incrémente la quantité** plutôt que de dupliquer
 - La liste "Bonap" et "Habituels" sont auto-créées dans Mealie si elles n'existent pas
 - **Tri IA** (`useCategorizeItems`) : applique d'abord les labels connus du `FoodLabelStore`, puis un seul appel `llmChat` pour le reste. Chaque affectation passe par `updateItemLabel` → `toItemUpdate` (voir piège PUT ci-dessus).
 - **Habituels** : créés avec `isFood: true` et un `foodId` résolu (création à la volée si l'aliment n'existe pas dans Mealie). Évite l'enregistrement en simple texte (note) qui empêchait le typage.
 
+### Nutrition CIQUAL (docs/superpowers/specs/2026-10-05-calcul-nutrition-ciqual.md)
+- **Dictionnaire d'aliments** côté BFF (`/data/bonap-nutrition-foods.json`, modules `ha-addon/bff-nutrition-*.cjs`) : une fiche par nom normalisé (`normalizeFoodKey`), partagée par toutes les recettes. Une fiche `validated` n'est jamais modifiée par l'automatique ou l'IA (`mergeFoodEntry`). Le nom CIQUAL est toujours relu côté serveur, jamais repris du client.
+- **IA dans le navigateur** (`llmChat`, clé API locale) : elle choisit un code parmi les candidats, jamais de nutriments. Garde-fous dans `ClassifyIngredientsUseCase` (code hors liste ou confiance basse → « à vérifier »).
+- **Nutrition par portion** : `extras.nutritionPerServing = "true"` + `extras.nutritionCoverage`. Sans le marqueur, la nutrition est un total de recette (anciennes données) : `balancedMealPlanner` divise alors par les portions. Couverture < 70 % → ignorée par l'auto-planification. **La liste `GET /api/recipes` ne renvoie ni `nutrition` ni `extras`** : Auto-planifier charge le détail de chaque recette (`GetAllRecipeDetailsUseCase`). Le tag `calorie-N` (écrit par `RecipeDrawer`, utilisé par le filtre calories) vaut les kcal **par portion**. `updateNutrition` ne doit jamais retomber sur un PATCH sans extras.
+- **Affichage fiche recette** : `nutritionForServings(recipe, portions)` (`shared/utils/nutritionDisplay.ts`) multiplie la nutrition par portion par la valeur du sélecteur « Portions » (anciens totaux ramenés d'abord à une portion).
+- Feature flag `ciqualAi` (`useCiqualAi` = flag + `llmConfigService.isConfigured()`). Lancement global : `/nutrition/ciqual`.
+
 ### Mode cuisine
 - **Ingrédients par étape** (issue #38) : Mealie relie une étape à ses ingrédients via `instruction.ingredientReferences[].referenceId` ↔ `ingredient.referenceId`. `ingredientsForInstruction()` (`shared/utils/instructionIngredients.ts`) fait la jointure ; `CookingMode` affiche l'encart « Pour cette étape » avec les quantités mises à l'échelle des portions. L'encart disparaît si la recette n'associe rien.
 - **L'association se crée dans Mealie**, pas dans Bonap — le formulaire Bonap ne l'édite pas, mais ne l'écrase plus (voir piège PUT recette).
+
+### Entrée / plat / dessert
+- **Recette** : tags `type-entree` / `type-plat` / `type-dessert` (comme les saisons), plusieurs possibles. Lecture via `getRecipeCourses()` (`shared/utils/course.ts`) : tags `type-` > catégories/tags évocateurs (« Desserts », « Entrées »…) > plat par défaut. Écriture via `updateCourses()` ou `RecipeFormData.courses` (absent = tags `type-` conservés) ; `courseTagNamesToWrite()` n'écrit aucun tag quand les catégories donnent déjà le bon type.
+- **Repas du planning** : `entryType` reste lunch/dinner, le type est un marqueur dans la note : `[s:4][c:dessert]note` (`shared/utils/mealText.ts`, absent = plat). Toujours réécrire la note via `buildMealText(meal, patch)` (`planningUtils.ts`), jamais `encodeServingsInText` à la main — sinon le type est perdu.
+- **Auto-planifier** et Suggestions IA ne tirent que des recettes `plat`. Un créneau « vide » = sans plat.
 
 ### Portions / scaling
 - **Lecture** : toujours `getRecipeServings(recipe)`, jamais `parseServings(recipe.recipeYield)` — voir `shared/utils/servings.ts`. Le bug #14 venait précisément de cette confusion.

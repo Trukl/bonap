@@ -1,6 +1,8 @@
 import type { MealieMealPlan, MealieRecipe } from "../types/mealie.ts"
 import { getCaloriesFromTags } from "./calorie.ts"
 import { getRecipeServings } from "./servings.ts"
+import { isNutritionPerServing, isNutritionPlannable } from "./nutritionCoverage.ts"
+import { recipeHasCourse } from "./course.ts"
 
 export interface AutoPlanSlot {
   date: string
@@ -77,11 +79,26 @@ function normalizeKey(value: string): string {
     .trim()
 }
 
-function getNutritionProfile(recipe: MealieRecipe): NutritionProfile {
+const EMPTY_PROFILE: NutritionProfile = {
+  calories: null,
+  protein: null,
+  carbs: null,
+  fat: null,
+  fiber: null,
+  sugar: null,
+  sodium: null,
+  saturatedFat: null,
+}
+
+function servingsDivisor(recipe: MealieRecipe): number {
+  if (isNutritionPerServing(recipe)) return 1
   const servings = getRecipeServings(recipe)
-  // Normalise par portion (valeurs par personne) pour comparer aux MEAL_TARGETS qui sont par personne.
-  // On ignore familySize ici : on veut scorer la valeur nutritionnelle d'une portion adulte.
-  const divisor = (servings && servings > 0) ? servings : 1
+  return servings && servings > 0 ? servings : 1
+}
+
+function getNutritionProfile(recipe: MealieRecipe): NutritionProfile {
+  if (!isNutritionPlannable(recipe)) return EMPTY_PROFILE
+  const divisor = servingsDivisor(recipe)
 
   const scale = (v: number | null) => v !== null ? Math.round(v / divisor * 10) / 10 : null
 
@@ -163,6 +180,9 @@ export function generateBalancedMealPlan(
   slots: AutoPlanSlot[],
   _familySize = 1,
 ): AutoPlannedMeal[] {
+  // Les créneaux sont des plats : jamais d'entrée ni de dessert seuls (tarte aux fraises en plat…).
+  recipes = recipes.filter((recipe) => recipeHasCourse(recipe, "plat"))
+
   // Pool principal : recettes avec nutrition. Pool secondaire : toutes les recettes (variété seulement).
   const withNutrition = recipes
     .map((recipe) => ({ recipe, nutrition: getNutritionProfile(recipe) }))

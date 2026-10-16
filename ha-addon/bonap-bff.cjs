@@ -6,8 +6,19 @@ const os = require('os')
 const path = require('path')
 const { execFile } = require('child_process')
 const { promisify } = require('util')
+const { safeRequest, assertUrlAllowed, BlockedAddressError } = require('./bff-net-guard.cjs')
+const { sanitizeSettings, validateSettingsPatch } = require('./bff-settings.cjs')
+const { normalizeFoodKey } = require('./bff-nutrition-text.cjs')
+const { MAX_PATCHES_PER_REQUEST, createFoodStore, validateFoodPatch } = require('./bff-nutrition-foods.cjs')
+const {
+  buildCiqualIndex,
+  classifyIngredients,
+  estimateRecipe,
+  findCandidates,
+  refreshItems,
+} = require('./bff-nutrition-classify.cjs')
 const app = express()
-const PORT = 3001
+const PORT = Number(process.env.BONAP_BFF_PORT) || 3001
 const execFileAsync = promisify(execFile)
 // Pure-JS windows-1252 decoder (Alpine Node uses small-icu which lacks extended encodings)
 function decodeWindows1252(buffer) {
@@ -31,6 +42,10 @@ app.use(express.json({ limit: '1mb' }))
 // Ollama server-side (injected via env vars from run.sh)
 const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/+$/, '')
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || ''
+// Cible Ollama choisie par le navigateur (Settings) : active par défaut pour
+// ne pas casser les installations existantes, désactivable côté serveur.
+// Ignorée dès qu'OLLAMA_URL est défini (la cible serveur fait foi).
+const DYNAMIC_OLLAMA_ENABLED = !/^(0|false|no|off)$/i.test(process.env.BONAP_DYNAMIC_OLLAMA_PROXY || '')
 
 const BASE_URL = 'https://www.marmiton.org'
 const SEARCH_URL = `${BASE_URL}/recettes/recherche.aspx`
@@ -51,13 +66,6 @@ const CIQUAL_CODES = {
   sodium: '10110',
 }
 const OPEN_FOOD_FACTS_SEARCH_URL = 'https://world.openfoodfacts.org/cgi/search.pl'
-const INGREDIENT_ALIASES = [
-  { pattern: /\bpaleron\b/g, value: 'boeuf' },
-  { pattern: /\btomates? pelee?s?\b/g, value: 'tomate en conserve' },
-  { pattern: /\bmais\b/g, value: 'mais en conserve' },
-  { pattern: /\bmais doux\b/g, value: 'mais en conserve' },
-  { pattern: /\bboite\s+de\s+mais\b/g, value: 'mais en conserve' },
-]
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
   'Accept-Language': 'fr-FR,fr;q=0.9',
@@ -135,39 +143,11 @@ function normalizeSpace(s) {
   return String(s ?? '').replace(/\s+/g, ' ').trim()
 }
 
-function normalizeNutritionText(s) {
-  return String(s ?? '')
-    .toLowerCase()
-    .replace(/œ/g, 'oe')
-    .replace(/æ/g, 'ae')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
 function parseNutritionNumber(value) {
   const raw = String(value ?? '').trim()
   if (!raw) return null
   const normalized = raw.replace(',', '.')
   const num = Number.parseFloat(normalized)
-  return Number.isFinite(num) ? num : null
-}
-
-function parseQuantityString(value) {
-  const raw = String(value ?? '').trim()
-    .replace(/\u00BC/g, '1/4')
-    .replace(/\u00BD/g, '1/2')
-    .replace(/\u00BE/g, '3/4')
-  if (!raw) return null
-  const frac = raw.match(/^(\d+)\s*\/\s*(\d+)$/)
-  if (frac) {
-    const num = Number.parseFloat(frac[1])
-    const den = Number.parseFloat(frac[2])
-    if (den > 0) return num / den
-  }
-  const num = Number.parseFloat(raw.replace(',', '.'))
   return Number.isFinite(num) ? num : null
 }
 
@@ -212,127 +192,13 @@ async function ensureCiqualDataset() {
   return { foodFile, compositionFile }
 }
 
-function buildCiqualTokenIndex(foods) {
-  const tokenIndex = new Map()
-  for (const food of foods) {
-    for (const token of new Set(food.tokens)) {
-      if (!tokenIndex.has(token)) tokenIndex.set(token, new Set())
-      tokenIndex.get(token).add(food.code)
-    }
-  }
-  return tokenIndex
-}
-
-function simplifyIngredientName(value) {
-  let normalized = normalizeNutritionText(value)
-    .replace(/\b(demi|moitie)\b/g, ' ')
-    .replace(/\b(en|au|a la|a l)\s+conserve\b/g, ' conserve ')
-    .replace(/\b(en|au|a la|a l)\s+bocal\b/g, ' conserve ')
-    .replace(/\bboite?s?\s+de\b/g, ' ')
-    .replace(/\bboite?s?\b/g, ' ')
-    .replace(/\bcannette?s?\b/g, ' ')
-    .replace(/\bconserve?s?\b/g, ' conserve ')
-    .replace(/\begouttee?s?\b/g, ' ')
-    .replace(/\begoutter\b/g, ' ')
-    .replace(/\b(de|du|des|d|la|le|les|un|une|a|au|aux)\b/g, ' ')
-    .replace(/\b(bio|frais|fraiche|fraiches|frais|frais?e?s?|hache|hachee|emince|emincee|rape|rapee|cuit|cuite|maison|extra vierge|vierge|entier|entiere|concasse|concassee|moulu|moulue)\b/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  for (const alias of INGREDIENT_ALIASES) {
-    normalized = normalized.replace(alias.pattern, alias.value)
-  }
-
-  return normalized.replace(/\s+/g, ' ').trim()
-}
-
-function normalizeUnitForNutrition(value) {
-  const key = normalizeNutritionText(value)
-  if (!key) return ''
-  if (/^(g|gramme|grammes)$/.test(key)) return 'g'
-  if (/^(kg|kilogramme|kilogrammes)$/.test(key)) return 'kg'
-  if (/^(mg|milligramme|milligrammes)$/.test(key)) return 'mg'
-  if (/^(ml|millilitre|millilitres)$/.test(key)) return 'ml'
-  if (/^(cl|centilitre|centilitres)$/.test(key)) return 'cl'
-  if (/^(l|litre|litres)$/.test(key)) return 'l'
-  if (/^(c a c|c cafe|cc|cuillere a cafe|cuilleree a cafe)$/.test(key)) return 'tsp'
-  if (/^(c a s|c soupe|cs|cuillere a soupe|cuilleree a soupe)$/.test(key)) return 'tbsp'
-  if (/^(boite|boites|conserve|conserves|can|cans)$/.test(key)) return 'can'
-  if (/^(pincee|pincees)$/.test(key)) return 'pinch'
-  if (/^(gousse|gousses)$/.test(key)) return 'clove'
-  return key
-}
-
-function inferCanWeight(foodName) {
-  const name = simplifyIngredientName(foodName)
-  if (/tomate/.test(name)) return 400
-  if (/mais/.test(name)) return 285
-  if (/thon/.test(name)) return 140
-  if (/pois chiche|haricot|lentille/.test(name)) return 250
-  return 300
-}
-
-function inferDensity(foodName) {
-  const name = simplifyIngredientName(foodName)
-  if (/huile/.test(name)) return 0.92
-  if (/miel|sirop/.test(name)) return 1.3
-  if (/lait|creme|yaourt/.test(name)) return 1.03
-  if (/farine/.test(name)) return 0.53
-  if (/sucre/.test(name)) return 0.85
-  return 1
-}
-
-function inferCountWeight(foodName) {
-  const name = simplifyIngredientName(foodName)
-  if (/oeuf/.test(name)) return 60
-  if (/oignon/.test(name)) return 110
-  if (/echalote/.test(name)) return 35
-  if (/carotte/.test(name)) return 125
-  if (/pomme de terre/.test(name)) return 150
-  if (/tomate/.test(name)) return 120
-  if (/citron/.test(name)) return 120
-  if (/courgette/.test(name)) return 200
-  if (/poivron/.test(name)) return 150
-  return null
-}
-
-function gramsFromIngredient(ingredient, matchedFoodName) {
-  const quantity = parseQuantityString(ingredient.quantity)
-  if (quantity === null || quantity <= 0) return null
-  const foodName = ingredient.food || ingredient.note || matchedFoodName || ''
-  const unit = normalizeUnitForNutrition(ingredient.unit)
-
-  if (!unit) {
-    const countWeight = inferCountWeight(foodName)
-    return countWeight ? quantity * countWeight : null
-  }
-  if (unit === 'g') return quantity
-  if (unit === 'kg') return quantity * 1000
-  if (unit === 'mg') return quantity / 1000
-
-  const density = inferDensity(foodName)
-  if (unit === 'ml') return quantity * density
-  if (unit === 'cl') return quantity * 10 * density
-  if (unit === 'l') return quantity * 1000 * density
-  if (unit === 'tsp') return quantity * 5 * density
-  if (unit === 'tbsp') return quantity * 15 * density
-  if (unit === 'can') return quantity * inferCanWeight(foodName)
-  if (unit === 'pinch') return quantity * 0.36
-  if (unit === 'clove') return quantity * 6
-
-  return null
-}
-
 function parseCiqualFoods(xml) {
   const foods = []
   for (const [, block] of xml.matchAll(/<ALIM>([\s\S]*?)<\/ALIM>/gi)) {
     const code = extractXmlValue(block, 'alim_code')
     const name = extractXmlValue(block, 'alim_nom_fr')
-    const indexName = extractXmlValue(block, 'ALIM_NOM_INDEX_FR') || name
     if (!code || !name) continue
-    const normalized = simplifyIngredientName(indexName)
-    const tokens = normalized.split(' ').filter((token) => token.length >= 2)
-    foods.push({ code, name, normalized, tokens })
+    foods.push({ code, name })
   }
   return foods
 }
@@ -368,8 +234,7 @@ async function loadCiqualDatabase() {
     const nutrientsByFood = parseCiqualComposition(decodeCiqualFile(compositionFile))
     const foodsWithNutrition = foods.filter((food) => nutrientsByFood.has(food.code))
     return {
-      foods: foodsWithNutrition,
-      tokenIndex: buildCiqualTokenIndex(foodsWithNutrition),
+      index: buildCiqualIndex(foodsWithNutrition),
       nutrientsByFood,
     }
   })().catch((err) => {
@@ -379,125 +244,10 @@ async function loadCiqualDatabase() {
   return ciqualCachePromise
 }
 
-function scoreCiqualFoodCandidate(food, ingredientTokens, ingredientText, rawIngredientName = '') {
-  const tokenOverlap = ingredientTokens.filter((token) => food.tokens.includes(token)).length
-  if (tokenOverlap === 0) return -Infinity
-  let score = tokenOverlap * 8
-  if (food.normalized === ingredientText) score += 20
-  if (food.normalized.startsWith(ingredientText) || ingredientText.startsWith(food.normalized)) score += 8
-  score -= Math.abs(food.tokens.length - ingredientTokens.length)
-  
-  // Bonus for matching cooking methods (friteuse, four, vapeur, poele, braiseе, grille, etc.)
-  const cookingMethods = [
-    { pattern: /friteuse|frit.?es?/i, food: /friteuse/ },
-    { pattern: /four|roti|roties|au four|cuisson four/i, food: /four|roti/ },
-    { pattern: /vapeur|cuit a la vapeur/i, food: /vapeur/ },
-    { pattern: /poele|a la poele|poele/i, food: /poele/ },
-    { pattern: /braiseе|braisee|braise/i, food: /braise/ },
-    { pattern: /grille|grilles?/i, food: /grille/ },
-    { pattern: /feu doux|doux/i, food: /doux/ },
-  ]
-  
-  for (const method of cookingMethods) {
-    const hasMethodInRaw = method.pattern.test(rawIngredientName)
-    const hasMethodInFood = method.food.test(food.name)
-    if (hasMethodInRaw && hasMethodInFood) {
-      score += 6  // Strong bonus: cooking method matches
-    } else if (hasMethodInRaw && !hasMethodInFood) {
-      score -= 4  // Penalty: user specifies cooking method but food doesn't have it
-    }
-  }
-  
-  return score
-}
-
-function findBestCiqualFood(ingredientName, db) {
-  const normalized = simplifyIngredientName(ingredientName)
-  const tokens = normalized.split(' ').filter((token) => token.length >= 2)
-  if (!tokens.length) return null
-
-  const candidateCodes = new Set()
-  for (const token of tokens) {
-    const codes = db.tokenIndex.get(token)
-    if (!codes) continue
-    for (const code of codes) candidateCodes.add(code)
-  }
-
-  let candidates = candidateCodes.size
-    ? db.foods.filter((food) => candidateCodes.has(food.code))
-    : db.foods
-
-  let best = null
-  let bestScore = -Infinity
-  for (const food of candidates) {
-    const score = scoreCiqualFoodCandidate(food, tokens, normalized, ingredientName)
-    if (score > bestScore) {
-      best = food
-      bestScore = score
-    }
-  }
-
-  return bestScore >= 8 ? best : null
-}
-
-function findTopCiqualFoods(ingredientName, db, limit = 5) {
-  const normalized = simplifyIngredientName(ingredientName)
-  const tokens = normalized.split(' ').filter((token) => token.length >= 2)
-  if (!tokens.length) return []
-
-  const candidateCodes = new Set()
-  for (const token of tokens) {
-    const codes = db.tokenIndex.get(token)
-    if (!codes) continue
-    for (const code of codes) candidateCodes.add(code)
-  }
-
-  const candidates = candidateCodes.size
-    ? db.foods.filter((food) => candidateCodes.has(food.code))
-    : db.foods
-
-  return candidates
-    .map((food) => ({ food, score: scoreCiqualFoodCandidate(food, tokens, normalized, ingredientName) }))
-    .filter((entry) => entry.score >= 4)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((entry) => entry.food.name)
-}
-
-function searchCiqualFoods(query, db, limit = 20) {
-  const normalized = simplifyIngredientName(query)
-  const tokens = normalized.split(' ').filter((token) => token.length >= 2)
-  if (!tokens.length) return []
-
-  const candidateCodes = new Set()
-  for (const token of tokens) {
-    const codes = db.tokenIndex.get(token)
-    if (!codes) continue
-    for (const code of codes) candidateCodes.add(code)
-  }
-
-  const candidates = candidateCodes.size
-    ? db.foods.filter((food) => candidateCodes.has(food.code))
-    : db.foods
-
-  return candidates
-    .map((food) => ({
-      food,
-      score: scoreCiqualFoodCandidate(food, tokens, normalized, query),
-    }))
-    .filter((entry) => entry.score >= 2)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((entry) => ({
-      code: entry.food.code,
-      name: entry.food.name,
-    }))
-}
-
 function scoreOpenFoodFactsProduct(product, ingredientText, ingredientTokens) {
-  const name = simplifyIngredientName(product?.product_name || '')
+  const name = normalizeFoodKey(product?.product_name || '')
   if (!name) return -Infinity
-  const category = simplifyIngredientName(Array.isArray(product?.categories_tags) ? product.categories_tags.join(' ') : '')
+  const category = normalizeFoodKey(Array.isArray(product?.categories_tags) ? product.categories_tags.join(' ') : '')
   const haystack = `${name} ${category}`.trim()
   let overlap = 0
   for (const token of ingredientTokens) {
@@ -546,7 +296,7 @@ function parseOpenFoodFactsNutrition(nutriments) {
 }
 
 async function findOpenFoodFactsFallback(ingredientName) {
-  const key = simplifyIngredientName(ingredientName)
+  const key = normalizeFoodKey(ingredientName)
   if (!key) return null
   if (openFoodFactsCache.has(key)) return openFoodFactsCache.get(key)
 
@@ -590,14 +340,6 @@ async function findOpenFoodFactsFallback(ingredientName) {
     openFoodFactsCache.set(key, null)
     return null
   }
-}
-
-function roundNutrition(value, digits = 1) {
-  return Number((value || 0).toFixed(digits))
-}
-
-function formatNutritionField(value, unit) {
-  return value > 0 ? `${roundNutrition(value)} ${unit}` : undefined
 }
 
 function normalizeSearchText(s) {
@@ -980,9 +722,10 @@ function extractRecipeHeuristic(html, pageUrl) {
 // Fetch and parse a single recipe page → {ingredients, steps, tags, prepTime, cookTime, totalTime}
 async function fetchRecipeDetails(url) {
   try {
-    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(8000) })
-    if (!res.ok) return null
-    const html = await res.text()
+    // L'URL vient du JSON-LD renvoyé par Marmiton : on ne lui fait pas confiance.
+    const res = await safeRequest(url, { headers: HEADERS, timeoutMs: 8000 })
+    if (res.status < 200 || res.status >= 300) return null
+    const html = res.body.toString('utf8')
     const schemas = parseJsonLd(html)
     const recipe = schemas.find(s => {
       const t = s['@type']
@@ -1223,10 +966,12 @@ app.get('/health', (_req, res) => res.json({
 // are shared between http://ip:8123 and https://domain access.
 const SETTINGS_FILE = '/data/bonap-settings.json'
 
+// Toujours filtré (voir bff-settings.cjs) : un fichier écrit par une version
+// antérieure peut contenir des clés inconnues ou une clé API.
 function readSettings() {
   try {
     if (fs.existsSync(SETTINGS_FILE)) {
-      return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+      return sanitizeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')))
     }
   } catch { /* ignore */ }
   return {}
@@ -1234,31 +979,75 @@ function readSettings() {
 
 function writeSettings(data) {
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), 'utf8')
+    const tmp = `${SETTINGS_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8')
+    fs.renameSync(tmp, SETTINGS_FILE)
   } catch (e) {
     console.error('[Bonap] Failed to write settings:', e.message)
   }
 }
+
+// Purge au démarrage les secrets / clés inconnues laissés par une version antérieure.
+if (fs.existsSync(SETTINGS_FILE)) writeSettings(readSettings())
 
 app.get('/settings', (_req, res) => {
   res.json(readSettings())
 })
 
 app.patch('/settings', (req, res) => {
-  const current = readSettings()
-  const updated = { ...current, ...req.body }
+  const result = validateSettingsPatch(req.body)
+  if (!result.ok) return res.status(400).json({ error: result.error })
+  const updated = { ...readSettings(), ...result.patch }
   writeSettings(updated)
   res.json(updated)
 })
 
+// ─── Dictionnaire d'aliments (docs/superpowers/specs/2026-10-05-calcul-nutrition-ciqual.md) ──────────────────────
+// Fichier dédié : /settings est limité à 16 Ko par clé.
+const NUTRITION_FOODS_FILE = process.env.BONAP_NUTRITION_FOODS_FILE
+  || (fs.existsSync('/data') ? '/data/bonap-nutrition-foods.json' : path.join(os.tmpdir(), 'bonap-nutrition-foods.json'))
+const foodStore = createFoodStore({ filePath: NUTRITION_FOODS_FILE })
+const MAX_INGREDIENTS_PER_REQUEST = 2000
+const MAX_INGREDIENT_TEXT_LENGTH = 300
+
+function sanitizeIngredientText(value) {
+  return typeof value === 'string' || typeof value === 'number'
+    ? String(value).slice(0, MAX_INGREDIENT_TEXT_LENGTH)
+    : ''
+}
+
+function readIngredientsBody(body) {
+  const raw = Array.isArray(body?.ingredients) ? body.ingredients : null
+  if (!raw || raw.length > MAX_INGREDIENTS_PER_REQUEST) return null
+  return raw
+    .filter((ingredient) => ingredient && typeof ingredient === 'object')
+    .map((ingredient) => ({
+      quantity: sanitizeIngredientText(ingredient.quantity),
+      unit: sanitizeIngredientText(ingredient.unit),
+      unitAbbreviation: sanitizeIngredientText(ingredient.unitAbbreviation),
+      food: sanitizeIngredientText(ingredient.food),
+      note: sanitizeIngredientText(ingredient.note),
+    }))
+}
+
+function readLegacyMappings(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  return Object.fromEntries(
+    Object.entries(raw)
+      .slice(0, MAX_INGREDIENTS_PER_REQUEST)
+      .filter(([, value]) => typeof value === 'string')
+      .map(([key, value]) => [normalizeSpace(key), value.slice(0, MAX_INGREDIENT_TEXT_LENGTH)]),
+  )
+}
+
 app.get('/ciqual/search', async (req, res) => {
   try {
-    const q = normalizeSpace(req.query.q || '')
+    const q = normalizeSpace(req.query.q || '').slice(0, MAX_INGREDIENT_TEXT_LENGTH)
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 50)
     if (!q) return res.json({ items: [] })
 
     const db = await loadCiqualDatabase()
-    const items = searchCiqualFoods(q, db, limit)
+    const items = findCandidates(q, db.index, limit).map(({ code, name }) => ({ code, name }))
     return res.json({ items })
   } catch (e) {
     console.error('[CIQUAL] Search error:', e.message)
@@ -1266,131 +1055,84 @@ app.get('/ciqual/search', async (req, res) => {
   }
 })
 
+function sendNutritionError(res, scope, e) {
+  console.error(`[Nutrition] ${scope} error:`, e.message)
+  res.status(500).json({ error: e.message })
+}
+
+app.get('/nutrition/foods', async (_req, res) => {
+  try {
+    const db = await loadCiqualDatabase()
+    res.json({ foods: foodStore.all(db.index) })
+  } catch (e) {
+    sendNutritionError(res, 'Foods', e)
+  }
+})
+
+app.post('/nutrition/foods', async (req, res) => {
+  try {
+    const entries = Array.isArray(req.body?.entries) ? req.body.entries : null
+    if (!entries || entries.length > MAX_PATCHES_PER_REQUEST) {
+      return res.status(400).json({ error: `Liste de fiches manquante ou trop longue (max ${MAX_PATCHES_PER_REQUEST})` })
+    }
+    const db = await loadCiqualDatabase()
+    const patches = []
+    for (const entry of entries) {
+      const result = validateFoodPatch(entry, db.index)
+      if (!result.ok) return res.status(400).json({ error: result.error })
+      patches.push(result.patch)
+    }
+    res.json(foodStore.upsert(patches, db.index))
+  } catch (e) {
+    sendNutritionError(res, 'Foods update', e)
+  }
+})
+
+app.post('/nutrition/classify', async (req, res) => {
+  try {
+    const ingredients = readIngredientsBody(req.body)
+    if (!ingredients) return res.status(400).json({ error: 'Liste d\'ingrédients manquante ou trop longue' })
+    const db = await loadCiqualDatabase()
+    const { items, patches } = classifyIngredients(ingredients, {
+      store: foodStore,
+      index: db.index,
+      aiEnabled: req.body?.aiEnabled === true,
+      legacyMappings: readLegacyMappings(req.body?.legacyMappings),
+    })
+    if (patches.length > 0) foodStore.upsert(patches, db.index)
+    res.json({ items: refreshItems(items, foodStore, db.index) })
+  } catch (e) {
+    sendNutritionError(res, 'Classify', e)
+  }
+})
+
 async function handleNutritionEstimate(req, res) {
   try {
-    const ingredients = Array.isArray(req.body?.ingredients) ? req.body.ingredients : []
-    const rawMatchHints = (req.body?.matchHints && typeof req.body.matchHints === 'object') ? req.body.matchHints : {}
-    const matchHints = Object.fromEntries(
-      Object.entries(rawMatchHints)
-        .map(([k, v]) => [normalizeSpace(k), normalizeSpace(v)])
-        .filter(([k, v]) => !!k && !!v),
-    )
-    if (!ingredients.length) {
+    const ingredients = readIngredientsBody(req.body)
+    if (!ingredients || ingredients.length === 0) {
       return res.status(400).json({ error: 'Liste d\'ingrédients manquante' })
     }
-
+    const servings = Number(req.body?.servings)
     const db = await loadCiqualDatabase()
-    const totals = {
-      calories: 0,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
-      fiber: 0,
-      sugar: 0,
-      sodium: 0,
-      saturatedFat: 0,
-    }
-    const matches = []
-    const unmatched = []
-
-    for (const ingredient of ingredients) {
-      const label = normalizeSpace(ingredient.food || ingredient.note || '')
-      if (!label) continue
-      const hinted = matchHints[label] || ''
-      const searchLabel = hinted || label
-
-      const match = findBestCiqualFood(searchLabel, db)
-      const ciqualName = match?.name || label
-      const grams = gramsFromIngredient(ingredient, ciqualName)
-      if (grams === null || grams <= 0) {
-        unmatched.push({ ingredient: label, matchedFood: ciqualName, reason: 'Quantité ou unité non exploitable' })
-        continue
-      }
-
-      let nutrients = null
-      let matchedFoodName = ''
-      let dataSource = 'ciqual'
-
-      if (match) {
-        nutrients = db.nutrientsByFood.get(match.code) || null
-        matchedFoodName = match.name
-      }
-
-      if (!nutrients) {
-        const offFallback = await findOpenFoodFactsFallback(searchLabel)
-        if (offFallback) {
-          nutrients = offFallback.nutrition
-          matchedFoodName = `[OFF] ${offFallback.name}`
-          dataSource = 'off'
-        }
-      }
-
-      if (!nutrients) {
-        const suggestions = findTopCiqualFoods(searchLabel, db, 6)
-        unmatched.push({
-          ingredient: label,
-          reason: 'Aucun aliment proche trouvé (CIQUAL/OFF)',
-          suggestions,
-        })
-        continue
-      }
-
-      const factor = grams / 100
-      totals.calories += (nutrients.calories || 0) * factor
-      totals.protein += (nutrients.protein || 0) * factor
-      totals.carbs += (nutrients.carbs || 0) * factor
-      totals.fat += (nutrients.fat || 0) * factor
-      totals.fiber += (nutrients.fiber || 0) * factor
-      totals.sugar += (nutrients.sugar || 0) * factor
-      totals.sodium += (nutrients.sodium || 0) * factor
-      totals.saturatedFat += (nutrients.saturatedFat || 0) * factor
-
-      matches.push({
-        ingredient: label,
-        ciqualFood: matchedFoodName,
-        amountGrams: roundNutrition(grams),
-        source: dataSource,
-        viaHint: !!hinted,
-      })
-    }
-
-    // Build ciqualMappings object for storing in recipe extras
-    const ciqualMappings = Object.fromEntries(
-      matches.map((m) => [m.ingredient, m.ciqualFood])
-    )
-
-    return res.json({
-      source: 'ANSES CIQUAL 2020 (+ fallback Open Food Facts)',
-      matchedCount: matches.length,
-      unmatchedCount: unmatched.length,
-      matches,
-      unmatched,
-      ciqualMappings,
-      nutrition: {
-        calories: formatNutritionField(totals.calories, 'kcal'),
-        proteinContent: formatNutritionField(totals.protein, 'g'),
-        carbohydrateContent: formatNutritionField(totals.carbs, 'g'),
-        fatContent: formatNutritionField(totals.fat, 'g'),
-        fiberContent: formatNutritionField(totals.fiber, 'g'),
-        sugarContent: formatNutritionField(totals.sugar, 'g'),
-        sodiumContent: formatNutritionField(totals.sodium, 'mg'),
-        saturatedFatContent: formatNutritionField(totals.saturatedFat, 'g'),
-      },
+    const estimate = await estimateRecipe(ingredients, servings, {
+      store: foodStore,
+      index: db.index,
+      nutrientsOf: (code) => db.nutrientsByFood.get(code) ?? null,
+      fallbackNutrients: async (label) => (await findOpenFoodFactsFallback(label))?.nutrition ?? null,
     })
+    res.json(estimate)
   } catch (e) {
-    console.error('[Nutrition] Estimate error:', e.message)
-    res.status(500).json({ error: e.message })
+    sendNutritionError(res, 'Estimate', e)
   }
 }
 
-// Current path used by the frontend
 app.post('/nutrition-estimate', handleNutritionEstimate)
-// Backwards-compatible alias: old frontend builds used /marmiton/nutrition-estimate
+// Alias historique : les anciens builds appelaient /marmiton/nutrition-estimate
 app.post('/marmiton/nutrition-estimate', handleNutritionEstimate)
 
 // Call Ollama server-side to extract a recipe from text
 // Returns { data, error } to provide explicit diagnostics back to the UI.
-async function callOllamaServerSide(ollamaUrl, ollamaModel, text) {
+async function callOllamaServerSide(ollamaUrl, ollamaModel, text, trusted) {
   if (!ollamaUrl || !ollamaModel) {
     return { data: null, error: 'Configuration Ollama manquante (URL ou modèle)' }
   }
@@ -1404,27 +1146,46 @@ async function callOllamaServerSide(ollamaUrl, ollamaModel, text) {
 Réponds UNIQUEMENT avec un objet JSON valide (sans markdown ni explication) de cette forme exacte:
 {"name":"Nom de la recette","ingredients":["ingrédient 1","ingrédient 2"],"steps":["Etape 1...","Etape 2..."],"tags":["tag1"],"imageUrl":"","prepTime":"","cookTime":"","totalTime":""}
 Les durées au format "X min" ou "Xh" ou "XhXX". Si absent, laisse vide ou tableau vide.`
+  const payload = JSON.stringify({
+    model: ollamaModel,
+    stream: false,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: text },
+    ],
+  })
+  // Keep this lower than nginx /api/bonap proxy_read_timeout to avoid gateway 504.
+  const timeoutMs = 45000
   try {
-    const r = await fetch(`${ollamaUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: ollamaModel,
-        stream: false,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: text },
-        ],
-      }),
-      // Keep this lower than nginx /api/bonap proxy_read_timeout to avoid gateway 504.
-      signal: AbortSignal.timeout(45000),
-    })
-    if (!r.ok) {
-      const errText = await r.text().catch(() => '')
-      const compact = errText.replace(/\s+/g, ' ').trim().slice(0, 220)
-      return { data: null, error: `Ollama HTTP ${r.status}${compact ? `: ${compact}` : ''}` }
+    let data
+    if (trusted) {
+      // URL fixée par l'administrateur (OLLAMA_URL) : aucune restriction.
+      const r = await fetch(`${ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: payload,
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!r.ok) {
+        const errText = await r.text().catch(() => '')
+        const compact = errText.replace(/\s+/g, ' ').trim().slice(0, 220)
+        return { data: null, error: `Ollama HTTP ${r.status}${compact ? `: ${compact}` : ''}` }
+      }
+      data = await r.json()
+    } else {
+      // URL venue du navigateur : réseau local uniquement, pas de redirection,
+      // et pas de corps d'erreur relayé (évite d'en faire un oracle réseau).
+      const r = await safeRequest(`${ollamaUrl}/api/chat`, {
+        policy: 'local',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: payload,
+        timeoutMs,
+        maxRedirects: 0,
+      })
+      if (r.status < 200 || r.status >= 300) return { data: null, error: `Ollama HTTP ${r.status}` }
+      data = JSON.parse(r.body.toString('utf8'))
     }
-    const data = await r.json()
     const content = data.message?.content ?? ''
     if (!content.trim()) {
       return { data: null, error: 'Réponse Ollama vide' }
@@ -1437,6 +1198,9 @@ Les durées au format "X min" ou "Xh" ou "XhXX". Si absent, laisse vide ou table
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     console.error('[Bonap BFF] Ollama server-side error:', msg)
+    if (!trusted && !(e instanceof BlockedAddressError)) {
+      return { data: null, error: 'Ollama injoignable' }
+    }
     return { data: null, error: msg || 'Erreur inconnue lors de l\'appel Ollama' }
   }
 }
@@ -1450,23 +1214,24 @@ app.get('/marmiton/fetch-recipe', async (req, res) => {
   if (!rawUrl) return res.status(400).json({ error: 'Paramètre url manquant' })
 
   // Effective Ollama config: env vars take priority, then query params (in-app settings)
-  const effectiveOllamaUrl = (OLLAMA_URL || (req.query.ollamaUrl ?? '').trim()).replace(/\/+$/, '')
-  const effectiveOllamaModel = OLLAMA_MODEL || (req.query.ollamaModel ?? '').trim()
+  const ollamaFromEnv = !!OLLAMA_URL
+  const queryOllamaUrl = DYNAMIC_OLLAMA_ENABLED ? String(req.query.ollamaUrl ?? '').trim() : ''
+  const effectiveOllamaUrl = (OLLAMA_URL || queryOllamaUrl).replace(/\/+$/, '')
+  const effectiveOllamaModel = OLLAMA_MODEL || String(req.query.ollamaModel ?? '').trim()
 
-  // Basic security: only http/https, block private IPs
-  let parsed
-  try { parsed = new URL(rawUrl) } catch { return res.status(400).json({ error: 'URL invalide' }) }
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    return res.status(400).json({ error: 'Protocole non supporté' })
-  }
-  if (/^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(parsed.hostname)) {
-    return res.status(400).json({ error: 'URL non autorisée' })
+  // SSRF : seules les IP publiques sont joignables. La vérification porte sur
+  // l'IP résolue au moment de la connexion (et à chaque redirection), pas sur
+  // la chaîne du hostname — voir bff-net-guard.cjs.
+  try {
+    assertUrlAllowed(rawUrl, 'public')
+  } catch (e) {
+    return res.status(400).json({ error: e.message })
   }
 
   try {
-    const r = await fetch(rawUrl, { headers: HEADERS, signal: AbortSignal.timeout(12000) })
-    if (!r.ok) return res.status(400).json({ error: `Erreur HTTP ${r.status}` })
-    const html = await r.text()
+    const r = await safeRequest(rawUrl, { headers: HEADERS, timeoutMs: 12000 })
+    if (r.status < 200 || r.status >= 300) return res.status(400).json({ error: `Erreur HTTP ${r.status}` })
+    const html = r.body.toString('utf8')
 
     // ⓪ Dedicated extraction for lefigaro.fr (prefer HTML blocks over truncated JSON-LD)
     if (/lefigaro\.fr/i.test(rawUrl)) {
@@ -1572,7 +1337,7 @@ app.get('/marmiton/fetch-recipe', async (req, res) => {
     // ⑦ If no schema and Ollama is configured, call it server-side (avoids nginx timeout)
     if (!schema && effectiveOllamaUrl && effectiveOllamaModel) {
       console.log(`[Bonap BFF] No JSON-LD found, calling Ollama server-side (${effectiveOllamaUrl}, ${effectiveOllamaModel})...`)
-      const ollamaResult = await callOllamaServerSide(effectiveOllamaUrl, effectiveOllamaModel, text)
+      const ollamaResult = await callOllamaServerSide(effectiveOllamaUrl, effectiveOllamaModel, text, ollamaFromEnv)
       const llmResult = ollamaResult.data
       const ollamaError = ollamaResult.error
       if (llmResult && llmResult.name) {
@@ -1593,50 +1358,60 @@ app.get('/marmiton/fetch-recipe', async (req, res) => {
     // text is still returned for browser-side LLM fallback (e.g. Anthropic, OpenAI)
     res.json({ schema, text })
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    if (e instanceof BlockedAddressError) return res.status(400).json({ error: e.message })
+    console.error('[Bonap BFF] fetch-recipe error:', e.message)
+    res.status(502).json({ error: 'Impossible de récupérer la page' })
   }
 })
 
 // GET /image?url=<encoded_url> — proxy pour télécharger l'image sans CORS
+// Seuls des formats raster sont relayés : servir du SVG ou du HTML distant
+// depuis l'origine de Bonap permettrait d'y exécuter du script (XSS).
+const PROXIED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
+const MAX_PROXIED_IMAGE_BYTES = 10 * 1024 * 1024
+
 app.get('/marmiton/image', async (req, res) => {
-  const url = (req.query.url ?? '').trim()
-  let parsedImg
-  try { parsedImg = new URL(url) } catch { return res.status(400).json({ error: 'URL invalide' }) }
-  if (!['http:', 'https:'].includes(parsedImg.protocol)) {
-    return res.status(400).json({ error: 'URL invalide' })
+  const url = String(req.query.url ?? '').trim()
+  try {
+    assertUrlAllowed(url, 'public')
+  } catch (e) {
+    return res.status(400).json({ error: e.message })
   }
   try {
-    const r = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(10000) })
-    if (!r.ok) return res.status(r.status).end()
-    const buf = await r.arrayBuffer()
-    res.set('Content-Type', r.headers.get('content-type') ?? 'image/jpeg')
+    const r = await safeRequest(url, { headers: HEADERS, timeoutMs: 10000, maxBytes: MAX_PROXIED_IMAGE_BYTES })
+    if (r.status < 200 || r.status >= 300) return res.status(502).end()
+    const contentType = String(r.headers['content-type'] || '').split(';')[0].trim().toLowerCase()
+    if (!PROXIED_IMAGE_TYPES.has(contentType)) {
+      return res.status(415).json({ error: 'Le contenu distant n\'est pas une image' })
+    }
+    res.set('Content-Type', contentType)
+    res.set('X-Content-Type-Options', 'nosniff')
+    res.set('Content-Security-Policy', "default-src 'none'; sandbox")
     res.set('Cache-Control', 'public, max-age=86400')
-    res.send(Buffer.from(buf))
+    res.send(r.body)
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    if (e instanceof BlockedAddressError) return res.status(400).json({ error: e.message })
+    console.error('[Bonap BFF] image proxy error:', e.message)
+    res.status(502).json({ error: 'Impossible de récupérer l\'image' })
   }
 })
 
-// ─── Dynamic Ollama proxy ─────────────────────────────────────────────────────
-// Allows the browser to reach a local Ollama instance via server-side forwarding,
-// avoiding mixed-content errors (HTTPS page → HTTP Ollama).
-// Restricted to private/local network addresses only (no SSRF to public internet).
+// ─── Ollama proxy ─────────────────────────────────────────────────────────────
+// Allows the browser to reach an Ollama instance via server-side forwarding,
+// avoiding mixed-content errors (HTTPS page → HTTP Ollama) and Ollama's CORS.
+//
+// Ce n'est PAS un proxy générique :
+//   - si OLLAMA_URL est défini, c'est la seule cible (l'en-tête est ignoré) ;
+//   - sinon, la cible X-Ollama-Target (réglage Settings) doit résoudre vers le
+//     réseau local (jamais link-local / métadonnées cloud), vérifié à la
+//     connexion ; désactivable via BONAP_DYNAMIC_OLLAMA_PROXY=false ;
+//   - seuls les endpoints Ollama utiles, en GET/POST JSON, sont relayés ;
+//   - seules les réponses JSON sont renvoyées, les erreurs réseau sont génériques
+//     (pas d'oracle de scan de ports).
 
-function isPrivateOrLocalUrl(rawUrl) {
-  try {
-    const u = new URL(rawUrl)
-    const h = u.hostname
-    return (
-      h === 'localhost' ||
-      h === '127.0.0.1' ||
-      /^10\./.test(h) ||
-      /^192\.168\./.test(h) ||
-      /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) ||
-      h.endsWith('.local')
-    )
-  } catch {
-    return false
-  }
+const OLLAMA_ROUTES = {
+  GET: new Set(['/api/tags', '/api/version', '/api/ps']),
+  POST: new Set(['/api/chat', '/api/generate', '/api/show', '/api/embed', '/api/embeddings']),
 }
 
 // Mounted with app.use() rather than a wildcard path: `/ollama-proxy/*path` is
@@ -1646,27 +1421,74 @@ function isPrivateOrLocalUrl(rawUrl) {
 // 404. A mount path behaves identically on both majors, and `req.url` then holds
 // the remaining subpath, query string included.
 app.use('/ollama-proxy', async (req, res) => {
-  const target = req.headers['x-ollama-target']
-  if (typeof target !== 'string' || !isPrivateOrLocalUrl(target)) {
-    return res
-      .status(400)
-      .json({ error: 'X-Ollama-Target manquant ou non autorisé (réseau local uniquement)' })
+  const subpath = new URL(req.url, 'http://localhost').pathname
+  if (!OLLAMA_ROUTES[req.method]?.has(subpath)) {
+    return res.status(404).json({ error: 'Endpoint Ollama non relayé' })
   }
-  const url = `${target.replace(/\/+$/, '')}${req.url}`
+
+  let target
+  let policy
+  if (OLLAMA_URL) {
+    target = OLLAMA_URL
+    policy = null
+  } else {
+    if (!DYNAMIC_OLLAMA_ENABLED) {
+      return res.status(403).json({ error: 'Proxy Ollama dynamique désactivé : définissez LLM_OLLAMA_URL côté serveur' })
+    }
+    target = req.headers['x-ollama-target']
+    policy = 'local'
+    try {
+      if (typeof target !== 'string') throw new BlockedAddressError('X-Ollama-Target manquant')
+      assertUrlAllowed(target, policy)
+    } catch (e) {
+      return res.status(400).json({ error: e.message })
+    }
+  }
+
+  const url = `${target.replace(/\/+$/, '')}${subpath}`
+  const body = req.method === 'POST' ? JSON.stringify(req.body ?? {}) : undefined
   try {
-    const hasBody = req.method !== 'GET' && req.method !== 'HEAD'
-    const upstreamRes = await fetch(url, {
-      method: req.method,
-      headers: { 'content-type': 'application/json' },
-      body: hasBody ? JSON.stringify(req.body) : undefined,
-    })
-    res.status(upstreamRes.status)
-    const ct = upstreamRes.headers.get('content-type')
-    if (ct) res.set('content-type', ct)
-    const body = await upstreamRes.text()
-    res.send(body)
+    let status
+    let contentType
+    let payload
+    if (policy === null) {
+      // Cible fixée par l'administrateur : pas de filtrage d'IP.
+      const upstream = await fetch(url, {
+        method: req.method,
+        headers: { 'content-type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(115000),
+      })
+      status = upstream.status
+      contentType = upstream.headers.get('content-type') || ''
+      payload = Buffer.from(await upstream.arrayBuffer())
+    } else {
+      const upstream = await safeRequest(url, {
+        policy,
+        method: req.method,
+        headers: { 'content-type': 'application/json' },
+        body,
+        timeoutMs: 115000, // < proxy_read_timeout nginx (120s)
+        maxBytes: 20 * 1024 * 1024,
+        maxRedirects: 0,
+      })
+      status = upstream.status
+      contentType = String(upstream.headers['content-type'] || '')
+      payload = upstream.body
+    }
+    if (!/^application\/(x-)?(nd)?json\b/i.test(contentType)) {
+      return res.status(502).json({ error: 'Réponse inattendue : la cible ne semble pas être Ollama' })
+    }
+    res.status(status)
+    res.set('content-type', contentType)
+    res.set('X-Content-Type-Options', 'nosniff')
+    res.send(payload)
   } catch (e) {
-    res.status(502).json({ error: `Proxy Ollama dynamique : ${e.message}` })
+    if (e instanceof BlockedAddressError) {
+      return res.status(400).json({ error: e.message })
+    }
+    console.error('[Bonap BFF] Ollama proxy error:', e.message)
+    res.status(502).json({ error: 'Ollama injoignable' })
   }
 })
 

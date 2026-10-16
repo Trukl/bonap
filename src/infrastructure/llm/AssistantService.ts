@@ -392,6 +392,7 @@ async function chatFallback(
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         'content-type': 'application/json',
+        ...(config.provider === 'perplexity' ? { 'X-Pplx-Integration': 'bonap' } : {}),
       },
       body: JSON.stringify({ model: config.model, messages }),
     })
@@ -407,10 +408,11 @@ async function chatFallback(
       parts: [{ text: m.content }],
     }))
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`,
+      // Clé en en-tête (recommandation Google), jamais en query string.
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`,
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': config.apiKey },
         body: JSON.stringify({ contents }),
       },
     )

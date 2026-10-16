@@ -9,11 +9,15 @@ import type {
   RecipeFilters,
   RecipeFormData,
   Season,
+  Course,
   MealieNutrition,
+  NutritionMetadata,
 } from "../../../shared/types/mealie.ts"
 import { isSeasonTag } from "../../../shared/utils/season.ts"
+import { courseTagNamesToWrite, isCourseTag } from "../../../shared/utils/course.ts"
 import { isCalorieTag, buildCalorieTag } from "../../../shared/utils/calorie.ts"
 import { generateId } from "../../../shared/utils/id.ts"
+import { NUTRITION_EXTRAS } from "../../../shared/utils/nutritionCoverage.ts"
 import { mealieApiClient } from "../api/index.ts"
 import { AuthService } from "../auth/AuthService.ts"
 import { MealieApiError } from "../../../shared/types/errors.ts"
@@ -39,6 +43,19 @@ export class RecipeRepository implements IRecipeRepository {
         : { name: tagName, slug: tagName }
     })
   }
+
+  /** Résout des tags par nom (id existant si le tag est déjà dans Mealie). */
+  private async resolveTagsByName(names: string[]): Promise<MealieTagObject[]> {
+    if (names.length === 0) return []
+    const response = await mealieApiClient.get<{ items: MealieTag[] }>("/api/organizers/tags?page=1&perPage=-1")
+    return names.map((name) => {
+      const found = response.items.find((t) => t.slug === name || t.name === name)
+      return found
+        ? { id: found.id, name: found.name, slug: found.slug }
+        : { name, slug: name }
+    })
+  }
+
   async getAll(
     page = 1,
     perPage = 30,
@@ -156,6 +173,12 @@ export class RecipeRepository implements IRecipeRepository {
       this.getBySlug(slug),
       this.resolveSeasonTags(data.seasons),
     ])
+    const courseTags: MealieTagObject[] = data.courses
+      ? await this.resolveTagsByName(courseTagNamesToWrite(data.courses, {
+          recipeCategory: data.categories,
+          tags: data.tags.filter((t) => !isSeasonTag(t)),
+        }))
+      : (current.tags ?? []).filter(isCourseTag).map((t) => ({ id: t.id, name: t.name, slug: t.slug }))
 
     const mappedIngredients = data.recipeIngredient
       .filter((ing) => ing.food || ing.note || ing.unit || (ing.quantity && ing.quantity !== "1"))
@@ -210,7 +233,7 @@ export class RecipeRepository implements IRecipeRepository {
             text: step.text,
           }
         }),
-      tags: [...data.tags, ...seasonTags],
+      tags: [...data.tags.filter((t) => !isCourseTag(t)), ...courseTags, ...seasonTags],
       extras: { ...(current.extras ?? {}), ...(data.extras ?? {}) },
     }
     return mealieApiClient.put<MealieRecipe>(`/api/recipes/${slug}`, payload)
@@ -270,48 +293,58 @@ export class RecipeRepository implements IRecipeRepository {
     }
   }
 
+  async updateCourses(slug: string, courses: Course[]): Promise<MealieRecipe> {
+    const current = await this.getBySlug(slug)
+    const otherTags = (current.tags ?? [])
+      .filter((t) => !isCourseTag(t))
+      .map((t) => ({ id: t.id, name: t.name, slug: t.slug }))
+    const courseTags = await this.resolveTagsByName(courseTagNamesToWrite(courses, {
+      recipeCategory: current.recipeCategory,
+      tags: otherTags,
+    }))
+    const newTags = [...otherTags, ...courseTags]
+    try {
+      return await mealieApiClient.patch<MealieRecipe>(`/api/recipes/${slug}`, { tags: newTags })
+    } catch {
+      return mealieApiClient.put<MealieRecipe>(`/api/recipes/${slug}`, {
+        ...this.simplifyRecipeForPut(current),
+        tags: newTags,
+      })
+    }
+  }
+
+  /**
+   * Enregistre la nutrition par portion et sa couverture. Certaines versions de
+   * Mealie rejettent les extras en PATCH (500) : on retombe alors sur un PUT
+   * complet, jamais sur un PATCH sans extras qui perdrait le marqueur « par portion ».
+   */
   async updateNutrition(
     slug: string,
     nutrition: MealieNutrition,
-    source?: string,
-    ciqualMappings?: Record<string, string>,
+    metadata: NutritionMetadata,
   ): Promise<MealieRecipe> {
     const current = await this.getBySlug(slug)
     const normalizedNutrition = this.normalizeNutrition(nutrition)
-    const hasCiqualMappings = !!ciqualMappings && Object.keys(ciqualMappings).length > 0
-
-    const extrasPayload: Record<string, string> = {
+    const extras: Record<string, string> = {
       ...(current.extras ?? {}),
-      ...(source ? { nutritionSource: source, nutritionEstimatedAt: new Date().toISOString() } : {}),
-      ...(hasCiqualMappings ? { nutritionCiqualMappings: JSON.stringify(ciqualMappings) } : {}),
-    }
-
-    const payloadWithExtras = {
-      nutrition: normalizedNutrition,
-      extras: extrasPayload,
+      [NUTRITION_EXTRAS.source]: metadata.source,
+      [NUTRITION_EXTRAS.estimatedAt]: new Date().toISOString(),
+      [NUTRITION_EXTRAS.coverage]: String(metadata.coverage),
+      [NUTRITION_EXTRAS.perServing]: String(metadata.perServing),
     }
 
     try {
-      return await mealieApiClient.patch<MealieRecipe>(`/api/recipes/${slug}`, payloadWithExtras)
+      return await mealieApiClient.patch<MealieRecipe>(`/api/recipes/${slug}`, {
+        nutrition: normalizedNutrition,
+        extras,
+      })
     } catch (error) {
-      // Some Mealie versions reject extras patch payloads with 500; retry with nutrition only.
       if (error instanceof MealieApiError && error.statusCode >= 500) {
-        try {
-          return await mealieApiClient.patch<MealieRecipe>(`/api/recipes/${slug}`, {
-            nutrition: normalizedNutrition,
-          })
-        } catch (retryError) {
-          // Final fallback: full PUT update (same strategy as recipe editor save),
-          // which is more stable across Mealie versions than PATCH for nested fields.
-          if (retryError instanceof MealieApiError && retryError.statusCode >= 500) {
-            return mealieApiClient.put<MealieRecipe>(`/api/recipes/${slug}`, {
-              ...current,
-              nutrition: normalizedNutrition,
-              extras: extrasPayload,
-            })
-          }
-          throw retryError
-        }
+        return mealieApiClient.put<MealieRecipe>(`/api/recipes/${slug}`, {
+          ...current,
+          nutrition: normalizedNutrition,
+          extras,
+        })
       }
       throw error
     }
